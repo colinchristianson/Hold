@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Device handoff{% endblock %}
+{% block body %}
+<section class="narrow">
+  <h1>Sign in with a device code</h1>
+  <p class="lede">Got a code from "My bookings" on another browser? Enter it here. Codes expire after 5 minutes and work once.</p>
+  {% if error %}<p class="flash error">{{ error }}</p>{% endif %}
+  <form method="post" class="stack">
+    <label><span>Device code</span><input type="text" name="code" autocomplete="off" required></label>
+    <button type="submit">Continue</button>
+  </form>
+</section>
+{% endblock %}

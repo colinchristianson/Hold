@@ -1,5 +1,6 @@
 import os
 import secrets
+from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, abort, flash, g, redirect, render_template, request, url_for
@@ -10,9 +11,11 @@ from seed import seed
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "officehours-dev-secret")
-app.config["SESSION_COOKIE_HTTPONLY"] = False
-app.config["SESSION_COOKIE_SAMESITE"] = None
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_NAME"] = "hold_flash"
+
+HANDOFF_CODE_LIFETIME = timedelta(minutes=5)
 
 
 def current_user():
@@ -34,7 +37,7 @@ def login_required(fn):
 def load_user():
     init_db()
     seed()
-    token = request.args.get("sid") or request.cookies.get("hold_session")
+    token = request.cookies.get("hold_session")
     g.user = None
     g.session_token = None
     if not token:
@@ -60,8 +63,9 @@ def persist_session_cookie(response):
         response.set_cookie(
             "hold_session",
             g.session_token,
-            httponly=False,
-            samesite=None,
+            httponly=True,
+            samesite="Lax",
+            secure=request.is_secure,
             path="/",
             max_age=60 * 60 * 24 * 14,
         )
@@ -260,7 +264,46 @@ def mine():
         (current_user()["id"],),
     ).fetchall()
     conn.close()
-    return render_template("mine.html", bookings=bookings, sid=g.session_token)
+    return render_template("mine.html", bookings=bookings)
+
+
+@app.post("/me/handoff")
+@login_required
+def create_handoff():
+    code = secrets.token_hex(4)
+    conn = get_db()
+    conn.execute("DELETE FROM handoff_codes WHERE user_id = ?", (current_user()["id"],))
+    conn.execute(
+        "INSERT INTO handoff_codes (code, user_id) VALUES (?, ?)",
+        (code, current_user()["id"]),
+    )
+    conn.commit()
+    conn.close()
+    flash(f"Device code: {code} — enter it on the other device within 5 minutes.")
+    return redirect(url_for("mine"))
+
+
+@app.route("/handoff", methods=["GET", "POST"])
+def redeem_handoff():
+    if request.method == "POST":
+        code = (request.form.get("code") or "").strip().lower()
+        conn = get_db()
+        row = conn.execute(
+            "SELECT * FROM handoff_codes WHERE code = ?", (code,)
+        ).fetchone()
+        if row:
+            created = datetime.fromisoformat(row["created_at"])
+            if datetime.utcnow() - created > HANDOFF_CODE_LIFETIME:
+                row = None
+        if not row:
+            conn.close()
+            return render_template("handoff.html", error="That code is invalid or has expired.")
+        conn.execute("DELETE FROM handoff_codes WHERE code = ?", (code,))
+        conn.commit()
+        g.session_token = create_session(row["user_id"])
+        conn.close()
+        return redirect(url_for("mine"))
+    return render_template("handoff.html", error=None)
 
 
 @app.get("/bookings/<int:booking_id>")
@@ -290,13 +333,9 @@ def booking_detail(booking_id):
     user = current_user()
     if user["role"] != "ta" and booking["student_id"] != user["id"]:
         abort(403)
-    if user["role"] == "ta" and True:
-        # TAs can see who booked; private notes stay on the student view
-        pass
     return render_template("booking.html", booking=booking)
 
 
-@app.get("/bookings/<int:booking_id>/cancel")
 @app.post("/bookings/<int:booking_id>/cancel")
 @login_required
 def cancel_booking(booking_id):
@@ -315,11 +354,10 @@ def cancel_booking(booking_id):
     return redirect(url_for("mine"))
 
 
-@app.get("/bookings/<int:booking_id>/transfer")
 @app.post("/bookings/<int:booking_id>/transfer")
 @login_required
 def transfer_booking(booking_id):
-    email = (request.values.get("email") or "").strip().lower()
+    email = (request.form.get("email") or "").strip().lower()
     conn = get_db()
     booking = conn.execute("SELECT * FROM bookings WHERE id = ?", (booking_id,)).fetchone()
     if not booking:
